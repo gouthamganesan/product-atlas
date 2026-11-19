@@ -1,0 +1,1199 @@
+#!/usr/bin/env python3
+"""figma: pull a Figma section into the pieces a design-context doc needs.
+
+Usage: figma capture --url '<section link>' --out <dir> [--drop-raw]
+
+Four subcommands. `capture` runs all three of the others in one shot and is
+what you normally want:
+
+  figma capture   --url '<section link>' --out <dir>    extract + frames + comments
+  figma extract   --url '<section link>' --out <dir>    structure, copy, canvas layout
+  figma frames    --url '<section link>' --out <dir>    one PNG per frame
+  figma comments  --url '<section link>' --out <dir>    comment threads, mapped to frames
+
+Why a CLI and not the Figma MCP server: MCP's get_metadata blows its transport
+limit (~184 KB) on real sections, which costs you the per-frame node IDs, and
+its screenshot tool is one-at-a-time and rate-limited. The REST API takes a
+hundred node IDs per call and returns the rendered text, the bounding boxes and
+the comment threads. Use MCP for a quick look at one frame; use this to capture
+a section.
+
+WHAT `extract` WRITES (in --out, named by node ID with `:` → `-`)
+  <node>-raw.json          full API response. Big (100s of MB on large files):
+                           delete it once you're done; the others are derived.
+  <node>-text-strings.txt  every distinct string in the section, sorted. This is
+                           the completeness check: a string in here that isn't in
+                           your doc means a frame or state you missed.
+  <node>-flow-outline.md   named FRAME/SECTION/COMPONENT/GROUP tree, indented by
+                           depth. Feeds `frames`.
+  <node>-layout.md         how the frames sit on the canvas: bands (visual rows),
+                           left-to-right order, the gap before each frame, where
+                           the gaps widen into cluster breaks, and which frames
+                           share a column. The arrangement is where the designer
+                           encoded the flow; layer names almost never carry it.
+
+WHAT `comments` WRITES
+  <node>-comments.md       threads grouped by the frame they're pinned on or
+                           near, in the same reading order as the layout map.
+  <node>-comments.json     same data, machine-readable (--json also prints it).
+
+  Anchoring: a comment pinned to a node is attributed to the frame that owns
+  that node; a comment pinned to bare canvas coordinates is hit-tested against
+  the frame boxes. Inside a frame → "on"; within --near-px of one → "near"
+  (that's the "in and around frames" case, and it's where design questions
+  usually live); otherwise "elsewhere in section". Comments outside the
+  section's bounds are dropped unless you pass --all-file.
+
+  "orphaned" is its own case and matters: the comment named a node that has
+  since been DELETED from the file, so Figma can no longer say where it sat.
+  Those threads cannot be attributed to this section with confidence (they may
+  belong to another one), but they often carry the reasoning for why a frame was
+  removed or replaced, so they're reported in a section of their own rather than
+  silently mixed in with the section's real comments or dropped.
+
+AUTH
+  Needs a Figma personal access token with **file_content:read** (structure,
+  text, bounding boxes, PNG rendering) and, for `comments`, **file_comments:read**.
+  Nothing else is used: not metadata, versions, or library scopes.
+
+  Read from, in order: --pat, $FIGMA_PAT, then the file named by $FIGMA_ENV
+  (default ~/.config/figma/figma.env, mode 0600, one `FIGMA_PAT=figd_…` line).
+  Prefer the file: --pat lands in shell history and `ps`. The token is never
+  printed, not even on error.
+
+  New token: Figma → Settings → Security → Personal access tokens.
+
+USAGE NOTES
+  --url accepts any /design/, /file/, /board/ or /proto/ link and reads both the
+  file key and the node-id from it, so you can paste straight from the browser.
+  --file-key / --node still win if you pass them.
+
+  `frames` filters the outline down to things that look like screens. Start with
+  --dry-run; widen with --depth / --min-depth if you get containers instead of
+  screens, or nothing at all.
+
+Zero external dependencies. Python 3.8+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_BASE = "https://api.figma.com/v1"
+BATCH_SIZE = 100  # Figma's /images endpoint takes hundreds; 100 is comfortable.
+
+# Node types we treat as "structural": candidates for the flow outline and for
+# being a laid-out screen on the canvas.
+STRUCTURAL_TYPES = {"FRAME", "SECTION", "COMPONENT", "COMPONENT_SET", "GROUP", "INSTANCE"}
+
+# Layer names Figma auto-generates. Keeping them turns the outline into noise.
+AUTO_NAME_PREFIXES = (
+    "Frame ", "Group ", "Component ", "Instance ",
+    "Rectangle ", "Ellipse ", "Vector ", "Polygon ", "Star ", "Line ", "Arrow ",
+)
+
+DEFAULT_EXCLUDE_NAMES = "Self,Cursors,Tool tip,Tooltip,Alert banner,Alert dialog popup"
+
+# Token file, one FIGMA_PAT=… line, mode 0600. Override with $FIGMA_ENV.
+DEFAULT_ENV_FILE = "~/.config/figma/figma.env"
+
+
+# ---------------------------------------------------------------- auth & http
+
+def load_pat(explicit: str | None) -> str:
+    """Resolve the token: --pat, then $FIGMA_PAT, then the 0600 env file."""
+    if explicit:
+        return explicit
+    env = os.environ.get("FIGMA_PAT")
+    if env:
+        return env
+    secret_file = Path(os.environ.get("FIGMA_ENV") or DEFAULT_ENV_FILE).expanduser()
+    if secret_file.exists():
+        mode = secret_file.stat().st_mode & 0o777
+        if mode & 0o077:
+            print(f"WARNING: {secret_file} is readable by other users (mode {mode:o}). "
+                  f"Run: chmod 600 {secret_file}", file=sys.stderr)
+        for line in secret_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() in ("FIGMA_PAT", "export FIGMA_PAT"):
+                return value.strip().strip("'\"")
+    die(
+        "No Figma token. Pass --pat, export FIGMA_PAT, or put FIGMA_PAT=… in\n"
+        f"  {secret_file}  (mode 0600; set FIGMA_ENV to use another path)\n"
+        "Create one at: Figma → Settings → Security → Personal access tokens\n"
+        "Scopes needed: file_content:read (+ file_comments:read for `comments`)."
+    )
+
+
+def die(msg: str, code: int = 1) -> "None":
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _http_get(path: str, pat: str, timeout: int = 120, retries: int = 3) -> dict:
+    """GET an API path (already query-encoded). Never echoes the token.
+
+    Figma's /images endpoint renders on demand and intermittently answers 500 or
+    429 on a batch that succeeds moments later, so transient failures are retried
+    with backoff before giving up. 4xx other than 429 is a real error, no retry.
+    """
+    url = f"{API_BASE}{path}"
+    for attempt in range(retries):
+        req = urllib.request.Request(url, headers={"X-Figma-Token": pat})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            transient = e.code == 429 or e.code >= 500
+            if transient and attempt < retries - 1:
+                wait = 2 ** attempt * 1.5
+                print(f"  Figma returned {e.code}; retrying in {wait:.0f}s "
+                      f"({attempt + 2}/{retries}) …", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                wait = 2 ** attempt * 1.5
+                print(f"  Network error ({e}); retrying in {wait:.0f}s "
+                      f"({attempt + 2}/{retries}) …", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+    return {}  # unreachable
+
+
+def api_get(path: str, pat: str, timeout: int = 120) -> dict:
+    """_http_get with Figma's error responses turned into clean exits."""
+    try:
+        return _http_get(path, pat, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        hint = ""
+        if e.code in (401, 403):
+            # Figma answers 403 both for a bad token and for a valid token missing a
+            # scope. The body distinguishes them, so don't guess.
+            if "invalid token" in body.lower():
+                hint = (
+                    "\nHint: Figma rejected the token itself, not a scope problem. Check it "
+                    "was copied whole, hasn't expired, and belongs to the account with access. "
+                    "Regenerate at Figma → Settings → Security → Personal access tokens."
+                )
+            else:
+                hint = (
+                    "\nHint: the token is recognised but not permitted here, usually a missing "
+                    "scope. file_content:read is needed for structure/text/images; "
+                    "file_comments:read for comments."
+                )
+        elif e.code == 404:
+            hint = "\nHint: 404 means the file key or node id is wrong, or you lack access to the file."
+        die(f"HTTP {e.code} from Figma {path.split('?')[0]}: {e.reason}\nBody: {body[:500]}{hint}", 2)
+    except urllib.error.URLError as e:
+        die(f"Network error reaching Figma API: {e}", 2)
+    return {}  # unreachable
+
+
+def parse_figma_url(url: str) -> tuple[str, str | None]:
+    """(file_key, node_id) from a Figma share link. node_id in colon form."""
+    m = re.search(r"/(?:design|file|board|proto)/([A-Za-z0-9]+)", url)
+    if not m:
+        raise ValueError(f"Could not find a file key in URL: {url}")
+    file_key = m.group(1)
+    raw = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("node-id", [None])[0]
+    node_id = urllib.parse.unquote(raw).replace("-", ":") if raw else None
+    return file_key, node_id
+
+
+def resolve_target(args, parser, need_node: bool = True) -> None:
+    """Fill args.file_key / args.node from args.url; explicit flags win."""
+    if getattr(args, "url", None):
+        try:
+            url_key, url_node = parse_figma_url(args.url)
+        except ValueError as e:
+            die(str(e))
+        if not args.file_key:
+            args.file_key = url_key
+        if not getattr(args, "node", None):
+            args.node = url_node
+    if not args.file_key:
+        die("No file key. Pass --url or --file-key.")
+    if need_node and not getattr(args, "node", None):
+        die("No node. Pass --node, or a --url containing a node-id.")
+
+
+def node_slug(node_id: str) -> str:
+    return node_id.replace(":", "-")
+
+
+def deeplink(file_key: str, node_id: str) -> str:
+    return f"https://www.figma.com/design/{file_key}/?node-id={node_id.replace(':', '-')}"
+
+
+# ---------------------------------------------------------------- tree walking
+
+def fetch_node(file_key: str, node_id: str, pat: str, depth: int | None = None) -> dict:
+    """GET /v1/files/{key}/nodes?ids={node}. depth limits how deep the tree comes back."""
+    params = {"ids": node_id.replace("-", ":")}
+    if depth is not None:
+        params["depth"] = str(depth)
+    return api_get(f"/files/{file_key}/nodes?{urllib.parse.urlencode(params)}", pat)
+
+
+def document_of(payload: dict, node_id: str) -> dict:
+    """Unwrap {"nodes": {"<id>": {"document": {...}}}} → the document."""
+    nodes = payload.get("nodes") or {}
+    if not nodes:
+        die(f"No nodes returned. Response keys: {list(payload.keys())}", 3)
+    wrapper = nodes.get(node_id.replace("-", ":")) or next(iter(nodes.values()))
+    doc = (wrapper or {}).get("document") or wrapper
+    if not doc:
+        die("Node was returned but had no document body.", 3)
+    return doc
+
+
+def walk(node: dict, depth: int = 0, parent_chain: list[str] | None = None):
+    """Depth-first (depth, parent_chain, node) for every descendant."""
+    parent_chain = list(parent_chain or [])
+    yield depth, parent_chain, node
+    for child in node.get("children") or []:
+        yield from walk(child, depth + 1, parent_chain + [node.get("name", "")])
+
+
+def is_meaningful_frame_name(name: str) -> bool:
+    """Drop Figma's auto-generated names ("Frame 12345") from the outline."""
+    if not name or not name.strip():
+        return False
+    stripped = name.strip()
+    if stripped.startswith(AUTO_NAME_PREFIXES):
+        rest = stripped.split(" ", 1)[1] if " " in stripped else ""
+        if rest.isdigit():
+            return False
+    return True
+
+
+def extract_text_strings(root: dict) -> list[str]:
+    found: set[str] = set()
+    for _d, _c, node in walk(root):
+        if node.get("type") == "TEXT":
+            text = (node.get("characters") or "").strip()
+            if text:
+                found.add(text)
+    return sorted(found)
+
+
+def build_flow_outline(root: dict, max_depth: int = 8) -> list[str]:
+    lines: list[str] = []
+    for depth, _chain, node in walk(root):
+        if depth > max_depth:
+            continue
+        ntype = node.get("type", "")
+        if ntype not in STRUCTURAL_TYPES:
+            continue
+        name = (node.get("name") or "").strip()
+        if not is_meaningful_frame_name(name):
+            continue
+        lines.append(f"{'  ' * depth}- **{name}** _({ntype}, `{node.get('id', '')}`)_")
+    return lines
+
+
+# ---------------------------------------------------------------- canvas layout
+
+def collect_positioned(root: dict, depth_wanted: int) -> list[dict]:
+    """Structural nodes at exactly `depth_wanted` that carry a bounding box.
+
+    Depth is relative to the fetched node, so depth 1 = frames the designer
+    placed directly on the section canvas.
+    """
+    out: list[dict] = []
+    for depth, _chain, node in walk(root):
+        if depth != depth_wanted or node.get("type") not in STRUCTURAL_TYPES:
+            continue
+        box = node.get("absoluteBoundingBox")
+        if not box or box.get("width") is None:
+            continue
+        out.append({
+            "name": (node.get("name") or "(unnamed)").strip(),
+            "id": node.get("id", ""),
+            "type": node.get("type", ""),
+            "x": float(box["x"]), "y": float(box["y"]),
+            "w": float(box["width"]), "h": float(box["height"]),
+            "node": node,
+        })
+    return out
+
+
+def node_text(node: dict, limit: int = 120) -> str:
+    """Concatenated TEXT content of a node's subtree, for naming annotations."""
+    parts: list[str] = []
+    for _d, _c, n in walk(node):
+        if n.get("type") == "TEXT":
+            t = (n.get("characters") or "").strip()
+            if t:
+                parts.append(t)
+    joined = " · ".join(parts)
+    return joined[:limit] + ("…" if len(joined) > limit else "")
+
+
+def split_screens_annotations(frames: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Separate laid-out screens from canvas furniture.
+
+    Designers drop section labels, legends and sticky notes on the canvas
+    alongside the screens. They're much smaller than a screen, and mixing them
+    into the bands wrecks the row structure, but they're valuable on their own,
+    because a label is usually the *name of the flow beneath it*.
+    """
+    if not frames:
+        return [], []
+    areas = [f["w"] * f["h"] for f in frames]
+    typical_area = median(areas)
+    screens, annotations = [], []
+    for f in frames:
+        if f["w"] * f["h"] >= typical_area * 0.25:
+            screens.append(f)
+        else:
+            annotations.append(f)
+    # If the split leaves almost nothing, the frames are uniform; treat all as screens.
+    if len(screens) < 2:
+        return frames, []
+    return screens, annotations
+
+
+def pick_layout_depth(root: dict, override: int | None = None) -> tuple[int, list[dict]]:
+    """Shallowest depth holding the laid-out screens.
+
+    Sections are sometimes a thin wrapper around one group, so depth 1 can hold
+    a single child. Descend until a level has 3+ positioned siblings.
+    """
+    if override is not None:
+        return override, collect_positioned(root, override)
+    for depth in range(1, 5):
+        found = collect_positioned(root, depth)
+        if len(found) >= 3:
+            return depth, found
+    return 1, collect_positioned(root, 1)
+
+
+def group_into_bands(frames: list[dict], min_overlap_ratio: float = 0.25) -> list[list[dict]]:
+    """Cluster frames into visual rows.
+
+    Two frames share a band when their vertical extents *substantially* overlap.
+    A bare-minimum overlap test merges rows that merely graze each other by a
+    pixel or two, so require the overlap to be at least `min_overlap_ratio` of
+    the shorter frame's height. Bands top-to-bottom, frames left-to-right.
+    """
+    bands: list[list[dict]] = []
+    for f in sorted(frames, key=lambda f: (f["y"], f["x"])):
+        for band in bands:
+            top = min(b["y"] for b in band)
+            bottom = max(b["y"] + b["h"] for b in band)
+            overlap = min(bottom, f["y"] + f["h"]) - max(top, f["y"])
+            if overlap >= min_overlap_ratio * min(f["h"], bottom - top):
+                band.append(f)
+                break
+        else:
+            bands.append([f])
+    for band in bands:
+        band.sort(key=lambda f: f["x"])
+    bands.sort(key=lambda band: min(b["y"] for b in band))
+    return bands
+
+
+def median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def reading_order(frames: list[dict]) -> list[dict]:
+    """Screens in flow order: top band first, left-to-right within each band."""
+    screens, _annotations = split_screens_annotations(frames)
+    return [f for band in group_into_bands(screens) for f in band]
+
+
+def label_bands(annotations: list[dict], bands: list[list[dict]], max_gap: float = 500.0) -> dict[int, list[dict]]:
+    """Attach each canvas label to the band it sits above and therefore names."""
+    assigned: dict[int, list[dict]] = {}
+    band_tops = [(i, min(b["y"] for b in band)) for i, band in enumerate(bands)]
+    for a in annotations:
+        a_bottom = a["y"] + a["h"]
+        best_i, best_gap = None, float("inf")
+        for i, top in band_tops:
+            gap = top - a_bottom
+            if -a["h"] <= gap < best_gap:  # band starts at or below the label
+                best_i, best_gap = i, gap
+        if best_i is not None and best_gap <= max_gap:
+            assigned.setdefault(best_i, []).append(a)
+        else:
+            assigned.setdefault(-1, []).append(a)
+    return assigned
+
+
+def build_layout_map(root: dict, layout_depth: int | None = None) -> list[str]:
+    depth, all_frames = pick_layout_depth(root, layout_depth)
+    if not all_frames:
+        return ["_No positioned child frames found. This node may be a single frame, not a section._"]
+
+    frames, annotations = split_screens_annotations(all_frames)
+
+    lines: list[str] = []
+    origin_x = min(f["x"] for f in all_frames)
+    origin_y = min(f["y"] for f in all_frames)
+    bands = group_into_bands(frames)
+    labels_for_band = label_bands(annotations, bands)
+
+    gaps = [cur["x"] - (prev["x"] + prev["w"]) for band in bands for prev, cur in zip(band, band[1:])]
+    typical_gap = median([g for g in gaps if g > 0]) or 0.0
+    break_threshold = typical_gap * 2.5 if typical_gap else float("inf")
+
+    lines.append(
+        f"_Depth {depth} relative to the fetched node · {len(frames)} screen frames "
+        f"(+{len(annotations)} canvas label/annotation) · {len(bands)} band(s) · "
+        f"typical gap {typical_gap:.0f}px · cluster break flagged above {break_threshold:.0f}px._"
+    )
+    lines.append("")
+    lines.append(
+        "Coordinates are relative to the top-left of the frame cluster. Reading order is "
+        "top band first, then left-to-right within each band. Frames far smaller than a "
+        "screen are treated as canvas furniture (labels, legends, stickies) and listed "
+        "under the band they sit above: a label is usually the name of the flow beneath it."
+    )
+    lines.append("")
+
+    order = 0
+    for bi, band in enumerate(bands, start=1):
+        band_top = min(b["y"] for b in band) - origin_y
+        titles = [t for t in (node_text(a["node"]) for a in labels_for_band.get(bi - 1, [])) if t]
+        title_txt = f" (labelled \"{' / '.join(titles)}\")" if titles else ""
+        lines.append(f"## Band {bi}{title_txt}: {len(band)} frame(s), top edge y≈{band_top:.0f}")
+        lines.append("")
+        lines.append("| # | Frame | Node | x | y | w×h | Gap before | Note |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        prev = None
+        for f in band:
+            order += 1
+            if prev is None:
+                gap_txt, note = "-", "band start"
+            else:
+                gap = f["x"] - (prev["x"] + prev["w"])
+                gap_txt = f"{gap:.0f}"
+                note = "▸ cluster break" if gap > break_threshold else ""
+            lines.append(
+                f"| {order} | {f['name']} | `{f['id']}` | {f['x'] - origin_x:.0f} | "
+                f"{f['y'] - origin_y:.0f} | {f['w']:.0f}×{f['h']:.0f} | {gap_txt} | {note} |"
+            )
+            prev = f
+        lines.append("")
+
+    if len(bands) > 1:
+        tolerance = max(24.0, median([f["w"] for f in frames]) * 0.1)
+        columns: list[list[dict]] = []
+        for f in sorted(frames, key=lambda f: (f["x"], f["y"])):
+            for col in columns:
+                if abs(f["x"] - col[0]["x"]) <= tolerance:
+                    col.append(f)
+                    break
+            else:
+                columns.append([f])
+        stacks = [c for c in columns if len(c) > 1]
+        lines.append("## Column stacks (vertically aligned across bands)")
+        lines.append("")
+        if stacks:
+            lines.append(
+                "Frames sharing an x position across bands are usually variants of the same "
+                "step: alternate states, error cases, or a branch of the flow above."
+            )
+            lines.append("")
+            for col in stacks:
+                col.sort(key=lambda f: f["y"])
+                names = " ↕ ".join(f"{f['name']} (`{f['id']}`)" for f in col)
+                lines.append(f"- x≈{col[0]['x'] - origin_x:.0f}: {names}")
+        else:
+            lines.append("_None: no two frames share a column._")
+        lines.append("")
+
+    if annotations:
+        lines.append("## Canvas labels & annotations")
+        lines.append("")
+        lines.append(
+            "Small frames sitting beside the screens. Their text usually names the flow, "
+            "or carries a designer note about it."
+        )
+        lines.append("")
+        lines.append(
+            "A label's x position matters too: one sitting partway along a band marks the "
+            "start of a sub-cluster inside that band, even when the frame gaps are even."
+        )
+        lines.append("")
+        frame_number = {f["id"]: i for i, f in enumerate(reading_order(all_frames), start=1)}
+        for bi, band in enumerate(bands, start=1):
+            for a in sorted(labels_for_band.get(bi - 1, []), key=lambda a: a["x"]):
+                text = node_text(a["node"]) or "_(no text)_"
+                # Which frame in the band does this label sit above?
+                nearest = min(band, key=lambda f: abs(f["x"] - a["x"]))
+                at = f", above frame #{frame_number.get(nearest['id'], '?')} ({nearest['name']})"
+                lines.append(
+                    f"- **Band {bi}**, x≈{a['x'] - origin_x:.0f}{at} ← "
+                    f"`{a['id']}` ({a['name'] or a['type']}): {text}"
+                )
+        for a in labels_for_band.get(-1, []):
+            text = node_text(a["node"]) or "_(no text)_"
+            lines.append(f"- **unattached** ← `{a['id']}` ({a['name'] or a['type']}): {text}")
+        lines.append("")
+
+    return lines
+
+
+# ---------------------------------------------------------------- comments
+
+def fetch_comments(file_key: str, pat: str) -> list[dict]:
+    """GET /v1/files/{key}/comments: every comment in the FILE (not just the section)."""
+    payload = api_get(f"/files/{file_key}/comments", pat)
+    return payload.get("comments") or []
+
+
+def index_nodes(root: dict) -> dict[str, dict]:
+    """node_id → {box, owning frame id} for everything in the fetched tree."""
+    index: dict[str, dict] = {}
+    for _d, _c, node in walk(root):
+        nid = node.get("id")
+        if nid:
+            index[nid] = node
+    return index
+
+
+def anchor_of(comment: dict) -> dict:
+    """Normalise client_meta into {node_id, offset_x, offset_y, x, y, is_region}."""
+    meta = comment.get("client_meta") or {}
+    out = {"node_id": None, "offset_x": 0.0, "offset_y": 0.0, "x": None, "y": None,
+           "is_region": bool(meta.get("region_height") or meta.get("region_width"))}
+    if meta.get("node_id"):
+        out["node_id"] = meta["node_id"]
+        offset = meta.get("node_offset") or {}
+        out["offset_x"] = float(offset.get("x") or 0.0)
+        out["offset_y"] = float(offset.get("y") or 0.0)
+    elif meta.get("x") is not None:
+        out["x"] = float(meta["x"])
+        out["y"] = float(meta.get("y") or 0.0)
+    return out
+
+
+def resolve_missing_boxes(file_key: str, pat: str, node_ids: list[str]) -> dict[str, dict]:
+    """Bounding boxes for node IDs that weren't in the fetched tree.
+
+    A comment can be pinned to a node deeper than the tree we pulled. Rather
+    than refetch the whole section at full depth, ask for those nodes directly
+    (depth=1, batched). Cheap and exact.
+    """
+    boxes: dict[str, dict] = {}
+    unique = [n for n in dict.fromkeys(node_ids) if n]
+    for start in range(0, len(unique), BATCH_SIZE):
+        batch = unique[start:start + BATCH_SIZE]
+        params = {"ids": ",".join(n.replace("-", ":") for n in batch), "depth": "1"}
+        payload = api_get(f"/files/{file_key}/nodes?{urllib.parse.urlencode(params)}", pat)
+        for nid, wrapper in (payload.get("nodes") or {}).items():
+            doc = (wrapper or {}).get("document") or {}
+            box = doc.get("absoluteBoundingBox")
+            if box and box.get("width") is not None:
+                boxes[nid] = {"x": float(box["x"]), "y": float(box["y"]),
+                              "w": float(box["width"]), "h": float(box["height"]),
+                              "name": (doc.get("name") or "").strip()}
+        if start + BATCH_SIZE < len(unique):
+            time.sleep(0.3)
+    return boxes
+
+
+def classify_comment(pin: tuple[float, float] | None, frames: list[dict],
+                     section_box: dict, near_px: float) -> tuple[str, dict | None, float]:
+    """Where does this pin sit? → (relation, frame, distance).
+
+    relation ∈ on | near | elsewhere-in-section | outside-section | unanchored
+    """
+    if pin is None:
+        return "unanchored", None, 0.0
+    px, py = pin
+    for f in frames:
+        if f["x"] <= px <= f["x"] + f["w"] and f["y"] <= py <= f["y"] + f["h"]:
+            return "on", f, 0.0
+    # Nearest frame by edge distance.
+    best, best_dist = None, float("inf")
+    for f in frames:
+        dx = max(f["x"] - px, 0.0, px - (f["x"] + f["w"]))
+        dy = max(f["y"] - py, 0.0, py - (f["y"] + f["h"]))
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist < best_dist:
+            best, best_dist = f, dist
+    if best is not None and best_dist <= near_px:
+        return "near", best, best_dist
+    inside_section = (
+        section_box and section_box["x"] <= px <= section_box["x"] + section_box["w"]
+        and section_box["y"] <= py <= section_box["y"] + section_box["h"]
+    )
+    if inside_section:
+        return "elsewhere-in-section", best, best_dist
+    return "outside-section", best, best_dist
+
+
+def build_comment_report(comments: list[dict], frames: list[dict], node_index: dict,
+                         extra_boxes: dict, section_box: dict, file_key: str,
+                         near_px: float, include_resolved: bool, all_file: bool) -> tuple[list[str], dict]:
+    """Group comment threads by the frame they're on or near, in reading order."""
+    ordered_frames = reading_order(frames)
+
+    # Resolve every comment to a pin position and a frame.
+    records: list[dict] = []
+    for c in comments:
+        a = anchor_of(c)
+        pin = None
+        if a["node_id"]:
+            node = node_index.get(a["node_id"])
+            box = None
+            if node:
+                nb = node.get("absoluteBoundingBox")
+                if nb and nb.get("width") is not None:
+                    box = {"x": float(nb["x"]), "y": float(nb["y"])}
+            if box is None and a["node_id"] in extra_boxes:
+                box = extra_boxes[a["node_id"]]
+            if box:
+                pin = (box["x"] + a["offset_x"], box["y"] + a["offset_y"])
+        elif a["x"] is not None:
+            pin = (a["x"], a["y"])
+        relation, frame, dist = classify_comment(pin, ordered_frames, section_box, near_px)
+        # A comment that named a node we couldn't place is ORPHANED, not file-level:
+        # the node was deleted from the file, so its original location is unknowable.
+        # It may or may not have belonged to this section; say so rather than imply.
+        if relation == "unanchored" and a["node_id"]:
+            relation = "orphaned"
+        records.append({
+            "id": c.get("id"), "parent_id": c.get("parent_id") or "",
+            "message": (c.get("message") or "").strip(),
+            "author": ((c.get("user") or {}).get("handle") or "unknown"),
+            "created_at": c.get("created_at") or "", "resolved_at": c.get("resolved_at"),
+            "anchor_node": a["node_id"], "is_region": a["is_region"],
+            "relation": relation, "frame_id": (frame or {}).get("id"),
+            "frame_name": (frame or {}).get("name"), "distance_px": round(dist, 1),
+        })
+
+    # Thread up: replies (parent_id set) hang off their root.
+    by_id = {r["id"]: r for r in records}
+    roots = [r for r in records if not r["parent_id"]]
+    replies: dict[str, list[dict]] = {}
+    for r in records:
+        if r["parent_id"]:
+            replies.setdefault(r["parent_id"], []).append(r)
+    for lst in replies.values():
+        lst.sort(key=lambda r: r["created_at"])
+
+    # A reply inherits its root's anchor; Figma only pins the root.
+    for root in roots:
+        for rep in replies.get(root["id"], []):
+            rep["relation"] = root["relation"]
+            rep["frame_id"] = root["frame_id"]
+            rep["frame_name"] = root["frame_name"]
+
+    def thread_open(root: dict) -> bool:
+        return not root.get("resolved_at")
+
+    kept = [r for r in roots if (include_resolved or thread_open(r))]
+    if not all_file:
+        kept = [r for r in kept if r["relation"] != "outside-section"]
+
+    dropped_resolved = len([r for r in roots if r.get("resolved_at")]) if not include_resolved else 0
+    dropped_outside = len([r for r in roots if r["relation"] == "outside-section"]) if not all_file else 0
+    n_resolved_kept = len([r for r in kept if r.get("resolved_at")])
+
+    # ---- markdown
+    lines: list[str] = []
+    on_near = [r for r in kept if r["relation"] in ("on", "near")]
+    n_orphaned = len([r for r in kept if r["relation"] == "orphaned"])
+    lines.append(
+        f"_{len(kept)} thread(s) in scope · {len(on_near)} pinned on or within {near_px:.0f}px "
+        f"of a frame · {n_orphaned} orphaned (anchor node deleted) · "
+        f"{len(kept) - len(on_near) - n_orphaned} other._"
+    )
+    if dropped_resolved or dropped_outside:
+        bits = []
+        if dropped_resolved:
+            bits.append(f"{dropped_resolved} resolved (pass --include-resolved)")
+        if dropped_outside:
+            bits.append(f"{dropped_outside} outside this section (pass --all-file)")
+        lines.append(f"_Hidden: {', '.join(bits)}._")
+    lines.append("")
+    lines.append(
+        "Comments are the designer's and reviewers' own words about the design: open "
+        "questions, decisions and caveats the frames themselves don't state. Treat open "
+        "threads as unresolved issues and author intent, not as settled behaviour. "
+        "**Resolved** threads are kept on purpose: they are where the decisions were "
+        "actually made, and they explain why a screen looks the way it does."
+    )
+    lines.append("")
+
+    def render_thread(root: dict, indent: str = "") -> list[str]:
+        out: list[str] = []
+        status = " · **resolved**" if root.get("resolved_at") else ""
+        where = ""
+        if root["relation"] == "near":
+            where = f" · pinned {root['distance_px']:.0f}px outside the frame"
+        elif root["relation"] == "elsewhere-in-section":
+            where = f" · loose on canvas, nearest frame {root['frame_name']}"
+        elif root["relation"] == "orphaned":
+            where = (" · anchor node `%s` no longer exists in the file, so its original "
+                     "location is unknown; it may belong to another section"
+                     % root["anchor_node"])
+        elif root["relation"] == "unanchored":
+            where = " · file-level comment, not pinned to the canvas"
+        region = " · region comment" if root["is_region"] else ""
+        out.append(f"{indent}- **{root['author']}** ({root['created_at'][:10]}){status}{where}{region}")
+        for para in root["message"].splitlines():
+            if para.strip():
+                out.append(f"{indent}  > {para.strip()}")
+        for rep in replies.get(root["id"], []):
+            out.append(f"{indent}  - ↳ **{rep['author']}** ({rep['created_at'][:10]})")
+            for para in rep["message"].splitlines():
+                if para.strip():
+                    out.append(f"{indent}    > {para.strip()}")
+        if root["anchor_node"]:
+            out.append(f"{indent}  · anchor `{root['anchor_node']}`: [open]({deeplink(file_key, root['anchor_node'])})")
+        return out
+
+    by_frame: dict[str, list[dict]] = {}
+    loose: list[dict] = []
+    orphaned: list[dict] = []
+    for r in kept:
+        if r["relation"] in ("on", "near") and r["frame_id"]:
+            by_frame.setdefault(r["frame_id"], []).append(r)
+        elif r["relation"] == "orphaned":
+            orphaned.append(r)
+        else:
+            loose.append(r)
+
+    if by_frame:
+        lines.append("## Threads by frame")
+        lines.append("")
+        for idx, f in enumerate(ordered_frames, start=1):
+            threads = by_frame.get(f["id"])
+            if not threads:
+                continue
+            lines.append(f"### {idx}. {f['name']} (`{f['id']}`, {len(threads)} thread(s))")
+            lines.append("")
+            for root in sorted(threads, key=lambda r: r["created_at"]):
+                lines.extend(render_thread(root))
+                lines.append("")
+    if loose:
+        lines.append("## Not tied to a single frame")
+        lines.append("")
+        for root in sorted(loose, key=lambda r: r["created_at"]):
+            lines.extend(render_thread(root))
+            lines.append("")
+    if orphaned:
+        lines.append("## Orphaned: anchor node deleted, section membership unknown")
+        lines.append("")
+        lines.append(
+            "These threads named a specific node that has since been deleted from the file, so "
+            "Figma no longer reports where they sat. They cannot be attributed to this section "
+            "with confidence and may belong to another one. They are kept because deleted-frame "
+            "threads often carry the reasoning for *why* a frame was removed or replaced. Read "
+            "them as file history, and confirm before treating any as a rule for this section."
+        )
+        lines.append("")
+        for root in sorted(orphaned, key=lambda r: r["created_at"]):
+            lines.extend(render_thread(root))
+            lines.append("")
+    if not kept:
+        lines.append("_No comments in scope._")
+        lines.append("")
+
+    payload = {
+        "file_key": file_key, "near_px": near_px,
+        "threads": [
+            {**root, "replies": replies.get(root["id"], [])}
+            for root in sorted(kept, key=lambda r: r["created_at"])
+        ],
+        "counts": {
+            "in_scope": len(kept), "on_or_near_frame": len(on_near),
+            "resolved_kept": n_resolved_kept, "orphaned": n_orphaned,
+            "hidden_resolved": dropped_resolved, "hidden_outside_section": dropped_outside,
+        },
+    }
+    return lines, payload
+
+
+# ---------------------------------------------------------------- images
+
+def safe_filename(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip())
+    return s.strip("-")[:60] or "unnamed"
+
+
+def parse_outline(path: Path) -> list[tuple[int, str, str, str]]:
+    """flow-outline.md → [(depth, name, type, node_id)]."""
+    line_re = re.compile(
+        r"^(?P<indent>\s*)-\s+\*\*(?P<name>.+?)\*\*\s+_\((?P<type>[A-Z_]+),\s+`(?P<id>[^`]+)`\)_"
+    )
+    out: list[tuple[int, str, str, str]] = []
+    for line in path.read_text().splitlines():
+        m = line_re.match(line)
+        if m:
+            out.append((len(m.group("indent")) // 2, m.group("name"), m.group("type"), m.group("id")))
+    return out
+
+
+def fetch_image_urls(file_key: str, node_ids: list[str], pat: str, scale: int) -> dict[str, str | None]:
+    if not node_ids:
+        return {}
+    qs = urllib.parse.urlencode({
+        "ids": ",".join(n.replace("-", ":") for n in node_ids),
+        "format": "png", "scale": str(scale),
+    })
+    payload = api_get(f"/images/{file_key}?{qs}", pat)
+    if payload.get("err"):
+        die(f"Figma /images error: {payload['err']}", 2)
+    return payload.get("images") or {}
+
+
+def download(url: str, dest: Path) -> int:
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=120) as resp:
+        data = resp.read()
+    dest.write_bytes(data)
+    return len(data)
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_extract(args, parser) -> dict:
+    resolve_target(args, parser)
+    pat = load_pat(args.pat)
+    out_dir = Path(args.out).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = node_slug(args.node)
+
+    print(f"Fetching node {args.node} from file {args.file_key} …", file=sys.stderr)
+    payload = fetch_node(args.file_key, args.node, pat)
+    document = document_of(payload, args.node)
+
+    raw_path = out_dir / f"{slug}-raw.json"
+    text_path = out_dir / f"{slug}-text-strings.txt"
+    outline_path = out_dir / f"{slug}-flow-outline.md"
+    layout_path = out_dir / f"{slug}-layout.md"
+
+    raw_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    strings = extract_text_strings(document)
+    text_path.write_text("\n".join(strings) + "\n")
+
+    outline_lines = build_flow_outline(document, max_depth=args.max_depth)
+    outline_path.write_text(
+        f"# Flow outline: `{args.node}` ({document.get('name', '(unnamed)')})\n\n"
+        f"_File: `{args.file_key}` · max depth: {args.max_depth} · named structural nodes only "
+        f"(auto-generated frame names are filtered out)._\n\n"
+        + "\n".join(outline_lines) + "\n"
+    )
+
+    layout_lines = build_layout_map(document, layout_depth=args.layout_depth)
+    layout_path.write_text(
+        f"# Canvas layout: `{args.node}` ({document.get('name', '(unnamed)')})\n\n"
+        f"_File: `{args.file_key}`: how the frames are arranged on the canvas. Derive flow "
+        f"order and branch structure from this; layer names give you neither._\n\n"
+        + "\n".join(layout_lines) + "\n"
+    )
+
+    raw_mb = raw_path.stat().st_size / 1_000_000
+    print(f"Wrote {raw_path.name} ({raw_mb:,.1f} MB)", file=sys.stderr)
+    print(f"Wrote {text_path.name} ({len(strings):,} distinct strings)", file=sys.stderr)
+    print(f"Wrote {outline_path.name} ({len(outline_lines):,} structural lines)", file=sys.stderr)
+    print(f"Wrote {layout_path.name}", file=sys.stderr)
+    if raw_mb > 50:
+        print(f"NOTE: {raw_path.name} is {raw_mb:,.0f} MB. Delete it once you're done.", file=sys.stderr)
+
+    return {"document": document, "outline_path": outline_path, "out_dir": out_dir,
+            "raw_path": raw_path, "strings": strings}
+
+
+def cmd_frames(args, parser, document: dict | None = None, outline_path: Path | None = None,
+               default_depth: int | None = None) -> int:
+    resolve_target(args, parser, need_node=False)
+    pat = load_pat(args.pat)
+    out_dir = Path(args.out).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # The screens sit at whatever depth the designer nested them at, which is
+    # the depth the layout map already found. Only fall back to 2 when we have
+    # no layout to learn from (standalone run against an outline file).
+    depth = args.depth if args.depth is not None else (default_depth or 2)
+    min_depth = args.min_depth if args.min_depth is not None else depth
+    if args.depth is None and default_depth:
+        print(f"Using outline depth {depth} (from the canvas layout).", file=sys.stderr)
+
+    candidates: list[tuple[int, str, str, str]] = []
+    if args.ids:
+        for i, nid in enumerate(s.strip() for s in args.ids.split(",") if s.strip()):
+            candidates.append((0, f"node-{i + 1}", "FRAME", nid))
+    else:
+        path = Path(args.outline).expanduser().resolve() if args.outline else outline_path
+        if not path or not path.exists():
+            die("Pass --outline <path> or --ids <list> (or run `capture`, which chains them).")
+        types_filter = None if args.types == "ALL" else set(args.types.split(","))
+        excludes = [s.strip() for s in args.exclude_names.split(",") if s.strip()]
+        for d, name, ntype, nid in parse_outline(path):
+            if d < min_depth or d > depth:
+                continue
+            if types_filter and ntype not in types_filter:
+                continue
+            if any(ex.lower() in name.lower() for ex in excludes):
+                continue
+            candidates.append((d, name, ntype, nid))
+
+    if args.limit > 0:
+        candidates = candidates[:args.limit]
+
+    print(f"Candidate frames: {len(candidates)}", file=sys.stderr)
+    if not candidates:
+        print("Nothing to do. Widen --depth/--min-depth or relax --exclude-names.", file=sys.stderr)
+        return 0
+
+    if args.dry_run:
+        for i, (depth, name, ntype, nid) in enumerate(candidates):
+            print(f"  [{i:03d}] d={depth} {ntype:10s} {nid:25s} {name}")
+        return len(candidates)
+
+    ids_only = [nid for _d, _n, _t, nid in candidates]
+    urls: dict[str, str | None] = {}
+    for start in range(0, len(ids_only), BATCH_SIZE):
+        batch = ids_only[start:start + BATCH_SIZE]
+        print(f"Requesting batch {start // BATCH_SIZE + 1} "
+              f"({start + 1}-{min(start + BATCH_SIZE, len(ids_only))} of {len(ids_only)}) …",
+              file=sys.stderr)
+        urls.update(fetch_image_urls(args.file_key, batch, pat, args.scale))
+        if start + BATCH_SIZE < len(ids_only):
+            time.sleep(0.5)
+
+    written = skipped = 0
+    for idx, (_d, name, _t, nid) in enumerate(candidates):
+        url = urls.get(nid.replace("-", ":"))
+        if not url:
+            skipped += 1
+            continue
+        dest = out_dir / f"{idx:03d}_{safe_filename(name)}_{node_slug(nid)}.png"
+        try:
+            n = download(url, dest)
+            written += 1
+            if (idx + 1) % 5 == 0 or idx + 1 == len(candidates):
+                print(f"  [{idx + 1}/{len(candidates)}] {dest.name} ({n:,} bytes)", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{idx + 1}] download failed for {nid}: {e}", file=sys.stderr)
+
+    print(f"Wrote {written} PNGs to {out_dir}.", file=sys.stderr)
+    if skipped:
+        print(f"Skipped {skipped} (Figma returned no URL, often an empty or hidden frame).", file=sys.stderr)
+    return written
+
+
+def cmd_comments(args, parser, document: dict | None = None) -> int:
+    resolve_target(args, parser)
+    pat = load_pat(args.pat)
+    out_dir = Path(args.out).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = node_slug(args.node)
+
+    # The frame boxes to map comments onto. Reuse the tree if `capture` has it;
+    # otherwise a shallow fetch is enough to place frames.
+    if document is None:
+        cached = out_dir / f"{slug}-raw.json"
+        if cached.exists() and not args.refetch:
+            print(f"Reusing {cached.name} for frame boxes.", file=sys.stderr)
+            document = document_of(json.loads(cached.read_text()), args.node)
+        else:
+            print(f"Fetching node {args.node} (depth {args.tree_depth}) for frame boxes …", file=sys.stderr)
+            document = document_of(fetch_node(args.file_key, args.node, pat, depth=args.tree_depth), args.node)
+
+    _depth, frames = pick_layout_depth(document, args.layout_depth)
+    if not frames:
+        print("WARNING: no positioned frames found; every comment will land in "
+              "'not tied to a single frame'.", file=sys.stderr)
+    sec_box = document.get("absoluteBoundingBox") or {}
+    section_box = ({"x": float(sec_box["x"]), "y": float(sec_box["y"]),
+                    "w": float(sec_box["width"]), "h": float(sec_box["height"])}
+                   if sec_box.get("width") is not None else {})
+
+    print(f"Fetching comments for file {args.file_key} …", file=sys.stderr)
+    comments = fetch_comments(args.file_key, pat)
+    print(f"File has {len(comments)} comment(s) total (all pages of the file).", file=sys.stderr)
+
+    node_index = index_nodes(document)
+    missing = [anchor_of(c)["node_id"] for c in comments
+               if anchor_of(c)["node_id"] and anchor_of(c)["node_id"] not in node_index]
+    extra_boxes: dict[str, dict] = {}
+    if missing:
+        print(f"Resolving {len(set(missing))} comment anchor(s) pinned below the fetched depth …",
+              file=sys.stderr)
+        extra_boxes = resolve_missing_boxes(args.file_key, pat, missing)
+
+    lines, payload = build_comment_report(
+        comments, frames, node_index, extra_boxes, section_box, args.file_key,
+        near_px=args.near_px, include_resolved=not args.only_open, all_file=args.all_file,
+    )
+
+    md_path = out_dir / f"{slug}-comments.md"
+    md_path.write_text(
+        f"# Comments: `{args.node}` ({document.get('name', '(unnamed)')})\n\n"
+        f"_File: `{args.file_key}`: comment threads mapped to the frames they sit on or beside._\n\n"
+        + "\n".join(lines) + "\n"
+    )
+    json_path = out_dir / f"{slug}-comments.json"
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    counts = payload["counts"]
+    print(f"Wrote {md_path.name}: {counts['in_scope']} thread(s) in scope, "
+          f"{counts['on_or_near_frame']} pinned on/near a frame "
+          f"({counts['resolved_kept']} of them resolved).", file=sys.stderr)
+    # Say what was filtered, so an empty report never looks like a broken tool.
+    if counts["hidden_outside_section"]:
+        print(f"  {counts['hidden_outside_section']} thread(s) elsewhere in the file "
+              f"(other sections); pass --all-file to keep them.", file=sys.stderr)
+    if counts["hidden_resolved"]:
+        print(f"  {counts['hidden_resolved']} resolved thread(s) dropped by --only-open.",
+              file=sys.stderr)
+    if counts["in_scope"] and not counts["on_or_near_frame"]:
+        print("  NOTE: nothing pinned to a frame; widen --near-px, or the pins may sit "
+              "deeper than --tree-depth.", file=sys.stderr)
+    print(f"Wrote {json_path.name}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return counts["in_scope"]
+
+
+def cmd_capture(args, parser) -> None:
+    """extract → frames → comments, sharing the one expensive tree fetch."""
+    result = cmd_extract(args, parser)
+    document, outline_path = result["document"], result["outline_path"]
+    layout_depth, _frames = pick_layout_depth(document, args.layout_depth)
+
+    print("", file=sys.stderr)
+    n_frames = cmd_frames(args, parser, document=document, outline_path=outline_path,
+                          default_depth=layout_depth)
+
+    n_threads = 0
+    if not args.no_comments:
+        print("", file=sys.stderr)
+        try:
+            n_threads = cmd_comments(args, parser, document=document)
+        except SystemExit as e:
+            # A missing file_comments:read scope shouldn't lose the capture.
+            print(f"Comments step failed (exit {e.code}); extract and frames are still on disk.",
+                  file=sys.stderr)
+
+    if args.drop_raw:
+        result["raw_path"].unlink(missing_ok=True)
+        print(f"\nDeleted {result['raw_path'].name} (--drop-raw).", file=sys.stderr)
+
+    print(f"\nCapture done: {len(result['strings']):,} strings, {n_frames} frames, "
+          f"{n_threads} comment threads → {result['out_dir']}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- arg parsing
+
+def add_target_args(p: argparse.ArgumentParser, need_node: bool = True) -> None:
+    p.add_argument("--url", help="Figma link; sets --file-key and --node from it.")
+    p.add_argument("--file-key", default=None, help="Figma file key (overrides --url).")
+    if need_node:
+        p.add_argument("--node", default=None, help="Section/frame node id, e.g. 8532:167871.")
+    p.add_argument("--pat", default=None, help="Figma token (else $FIGMA_PAT, else $FIGMA_ENV or ~/.config/figma/figma.env).")
+    p.add_argument("--out", required=True, help="Output directory (created if missing).")
+
+
+def add_layout_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--layout-depth", type=int, default=None,
+                   help="Depth to read the canvas arrangement from (default: auto, the shallowest "
+                        "depth with 3+ positioned frames).")
+
+
+def add_frames_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--outline", help="Path to a *-flow-outline.md (default: the one just written).")
+    p.add_argument("--ids", help="Comma-separated node ids, bypassing the outline.")
+    p.add_argument("--depth", type=int, default=None,
+                   help="Max outline depth. Default: the depth the canvas layout was read "
+                        "from under `capture`, else 2.")
+    p.add_argument("--min-depth", type=int, default=None,
+                   help="Min outline depth. Default: same as --depth.")
+    p.add_argument("--types", default="FRAME", help="Node types to keep, or ALL (default FRAME).")
+    p.add_argument("--exclude-names", default=DEFAULT_EXCLUDE_NAMES,
+                   help="Name substrings to skip (comma-separated).")
+    p.add_argument("--scale", type=int, default=2, help="PNG scale 1..4 (default 2).")
+    p.add_argument("--limit", type=int, default=0, help="Cap frame count (0 = no cap).")
+    p.add_argument("--dry-run", action="store_true", help="List frames, download nothing.")
+
+
+def add_comments_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--near-px", type=float, default=200.0,
+                   help="How far outside a frame a pin still counts as 'near' it (default 200).")
+    p.add_argument("--only-open", action="store_true",
+                   help="Drop resolved threads. Off by default: resolved threads are where "
+                        "the decisions were made, and a design-context doc wants them.")
+    p.add_argument("--all-file", action="store_true",
+                   help="Keep comments outside this section's bounds too.")
+    p.add_argument("--tree-depth", type=int, default=4,
+                   help="Depth to fetch for frame boxes when there's no cached tree (default 4).")
+    p.add_argument("--refetch", action="store_true", help="Ignore a cached *-raw.json.")
+    p.add_argument("--json", action="store_true", help="Also print the JSON payload to stdout.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="figma", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_ex = sub.add_parser("extract", help="Structure, copy strings and canvas layout.",
+                          formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_target_args(p_ex)
+    add_layout_args(p_ex)
+    p_ex.add_argument("--max-depth", type=int, default=8, help="Max flow-outline depth (default 8).")
+
+    p_fr = sub.add_parser("frames", help="One PNG per frame.",
+                          formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_target_args(p_fr, need_node=False)
+    add_frames_args(p_fr)
+
+    p_co = sub.add_parser("comments", help="Comment threads, mapped to frames.",
+                          formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_target_args(p_co)
+    add_layout_args(p_co)
+    add_comments_args(p_co)
+
+    p_ca = sub.add_parser("capture", help="extract + frames + comments in one pass.",
+                          formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_target_args(p_ca)
+    add_layout_args(p_ca)
+    add_frames_args(p_ca)
+    add_comments_args(p_ca)
+    p_ca.add_argument("--max-depth", type=int, default=8, help="Max flow-outline depth (default 8).")
+    p_ca.add_argument("--no-comments", action="store_true", help="Skip the comments step.")
+    p_ca.add_argument("--drop-raw", action="store_true",
+                      help="Delete the big *-raw.json when done.")
+
+    args = parser.parse_args()
+    if args.cmd == "extract":
+        cmd_extract(args, parser)
+    elif args.cmd == "frames":
+        cmd_frames(args, parser)
+    elif args.cmd == "comments":
+        cmd_comments(args, parser)
+    elif args.cmd == "capture":
+        cmd_capture(args, parser)
+
+
+if __name__ == "__main__":
+    main()
